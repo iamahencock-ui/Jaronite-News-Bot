@@ -26,6 +26,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,   // privileged — enable in Discord Dev Portal → Bot → Privileged Gateway Intents
+    GatewayIntentBits.GuildMessages,  // needed to receive message events for the !checkpayments command
+    GatewayIntentBits.MessageContent, // privileged — enable in Discord Dev Portal → Bot → Privileged Gateway Intents
     // Note: GuildInvites is NOT a valid GatewayIntentBits value in discord.js v14.
     // InviteCreate/InviteDelete events and guild.invites.fetch() work with just
     // the Guilds intent. The bot needs Manage Guild *permission* (not a special
@@ -135,17 +137,26 @@ const PAYMENT_ROLE     = process.env.PAYMENT_ROLE_ID        || NOTIFY_ROLE;
 
 const SLOT_LABELS = { 1: 'Slot 1 (Homepage)', 2: 'Slot 2 (Article)', 3: 'Slot 3 (Sidebar)' };
 
-async function checkOverduePayments() {
+// opts.targetChannel — a channel to post into instead of the default PAYMENT_CHANNEL
+//                      (used by the !checkpayments command to reply in-place).
+// opts.announceClear — if true, post a confirmation even when nothing is due
+//                      (manual command), instead of staying silent (cron).
+async function checkOverduePayments(opts = {}) {
+  const { targetChannel = null, announceClear = false } = opts;
+
   if (!WORKER_URL || !BOT_API_KEY) {
     console.warn('WORKER_BASE_URL or BOT_API_KEY not set — payment check skipped');
+    if (targetChannel) await targetChannel.send('⚠️ Payment check is misconfigured: `WORKER_BASE_URL` or `BOT_API_KEY` is not set.');
     return;
   }
 
-  const guild = client.guilds.cache.get(GUILD_ID) || client.guilds.cache.first();
-  if (!guild) { console.error('Guild not found for payment check'); return; }
-
-  const channel = guild.channels.cache.get(PAYMENT_CHANNEL);
-  if (!channel) { console.error(`Payment channel ${PAYMENT_CHANNEL} not found`); return; }
+  let channel = targetChannel;
+  if (!channel) {
+    const guild = client.guilds.cache.get(GUILD_ID) || client.guilds.cache.first();
+    if (!guild) { console.error('Guild not found for payment check'); return; }
+    channel = guild.channels.cache.get(PAYMENT_CHANNEL);
+    if (!channel) { console.error(`Payment channel ${PAYMENT_CHANNEL} not found`); return; }
+  }
 
   // Fetch won bids from the last 30 days (the API default window)
   let bids;
@@ -156,11 +167,13 @@ async function checkOverduePayments() {
     );
     if (!res.ok) {
       console.error(`Payment status API returned ${res.status}`);
+      if (targetChannel) await targetChannel.send(`⚠️ Couldn't fetch payment status — the API returned ${res.status}.`);
       return;
     }
     bids = await res.json();
   } catch (e) {
     console.error('Failed to fetch payment status:', e);
+    if (targetChannel) await targetChannel.send('⚠️ Couldn\'t reach the payment-status API. Check the worker URL and that it\'s deployed.');
     return;
   }
 
@@ -187,6 +200,9 @@ async function checkOverduePayments() {
   const total = overdue.length + dueSoon.length + unpaidRest.length;
   if (total === 0) {
     console.log('Payment check: all won bids are paid — no alert needed');
+    if (announceClear && channel) {
+      await channel.send('✅ All won ad bids are paid up — nothing outstanding.');
+    }
     return;
   }
 
@@ -242,6 +258,36 @@ async function checkOverduePayments() {
   await channel.send(lines.join('\n'));
   console.log(`Payment check: posted alert — ${overdue.length} overdue, ${dueSoon.length} due soon, ${unpaidRest.length} upcoming unpaid`);
 }
+
+// ================================================================
+// !checkpayments — manual trigger for the payment report.
+// Posts the report into the channel where the command was used.
+// Restricted to members with the Manage Guild permission (staff),
+// so advertiser contact details aren't exposed to everyone.
+// ================================================================
+const { PermissionFlagsBits } = require('discord.js');
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  if (!message.guild) return; // ignore DMs
+  const content = message.content.trim().toLowerCase();
+  if (content !== '!checkpayments') return;
+
+  // Permission gate: must be able to Manage Guild (admins/managers).
+  const member = message.member;
+  if (!member || !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    await message.reply('You need the **Manage Server** permission to run this.');
+    return;
+  }
+
+  await message.channel.sendTyping();
+  try {
+    await checkOverduePayments({ targetChannel: message.channel, announceClear: true });
+  } catch (e) {
+    console.error('!checkpayments error:', e);
+    await message.reply('Something went wrong running the payment check — see the bot logs.');
+  }
+});
 
 // Schedule daily at 9 AM UTC
 client.once(Events.ClientReady, () => {
