@@ -25,8 +25,11 @@ if (!TOKEN) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,   // needed for guildMemberAdd
-    GatewayIntentBits.GuildInvites,   // needed to read invite use counts
+    GatewayIntentBits.GuildMembers,   // privileged — enable in Discord Dev Portal → Bot → Privileged Gateway Intents
+    // Note: GuildInvites is NOT a valid GatewayIntentBits value in discord.js v14.
+    // InviteCreate/InviteDelete events and guild.invites.fetch() work with just
+    // the Guilds intent. The bot needs Manage Guild *permission* (not a special
+    // intent) to read invite use counts.
   ],
 });
 
