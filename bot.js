@@ -111,3 +111,145 @@ client.on(Events.InviteDelete, async (invite) => {
 });
 
 client.login(TOKEN);
+
+// ================================================================
+// Payment overdue checker
+// Runs daily at 9 AM UTC via node-cron.
+//
+// Fetches all won-but-unpaid bids from the Worker API and posts a
+// summary to the staff channel, pinging @NOTIFY_ROLE.
+//
+// Additional environment variables needed:
+//   WORKER_BASE_URL        — e.g. https://jaronitenewsinc.ejblox476.workers.dev
+//   BOT_API_KEY            — the permanent key you set as a Worker secret (BOT_API_KEY)
+//   PAYMENT_CHANNEL_ID     — channel to post payment alerts in (can be same as NOTIFY_CHANNEL)
+//   PAYMENT_ROLE_ID        — role to ping for payment alerts (can be same as NOTIFY_ROLE)
+// ================================================================
+
+const cron = require('node-cron');
+
+const WORKER_URL       = process.env.WORKER_BASE_URL        || '';
+const BOT_API_KEY      = process.env.BOT_API_KEY            || '';
+const PAYMENT_CHANNEL  = process.env.PAYMENT_CHANNEL_ID     || NOTIFY_CHANNEL;
+const PAYMENT_ROLE     = process.env.PAYMENT_ROLE_ID        || NOTIFY_ROLE;
+
+const SLOT_LABELS = { 1: 'Slot 1 (Homepage)', 2: 'Slot 2 (Article)', 3: 'Slot 3 (Sidebar)' };
+
+async function checkOverduePayments() {
+  if (!WORKER_URL || !BOT_API_KEY) {
+    console.warn('WORKER_BASE_URL or BOT_API_KEY not set — payment check skipped');
+    return;
+  }
+
+  const guild = client.guilds.cache.get(GUILD_ID) || client.guilds.cache.first();
+  if (!guild) { console.error('Guild not found for payment check'); return; }
+
+  const channel = guild.channels.cache.get(PAYMENT_CHANNEL);
+  if (!channel) { console.error(`Payment channel ${PAYMENT_CHANNEL} not found`); return; }
+
+  // Fetch won bids from the last 30 days (the API default window)
+  let bids;
+  try {
+    const res = await fetch(
+      `${WORKER_URL}/api/ads/payment-status`,
+      { headers: { 'X-Bot-Key': BOT_API_KEY } }
+    );
+    if (!res.ok) {
+      console.error(`Payment status API returned ${res.status}`);
+      return;
+    }
+    bids = await res.json();
+  } catch (e) {
+    console.error('Failed to fetch payment status:', e);
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Bucket bids by urgency
+  const overdue   = [];  // ad date has passed, still unpaid
+  const dueSoon   = [];  // ad date is within 2 days, still unpaid
+  const unpaidRest = []; // unpaid with more than 2 days to go
+
+  for (const bid of bids) {
+    const status = bid.payment_status;
+    if (status !== 'awaiting_payment' && status !== 'underpaid') continue;
+
+    const daysUntil = Math.ceil(
+      (new Date(bid.target_date) - new Date(today)) / 86400000
+    );
+
+    if (daysUntil < 0)      overdue.push({ ...bid, daysUntil });
+    else if (daysUntil <= 2) dueSoon.push({ ...bid, daysUntil });
+    else                     unpaidRest.push({ ...bid, daysUntil });
+  }
+
+  const total = overdue.length + dueSoon.length + unpaidRest.length;
+  if (total === 0) {
+    console.log('Payment check: all won bids are paid — no alert needed');
+    return;
+  }
+
+  // Build the message
+  const lines = [
+    `💸 <@&${PAYMENT_ROLE}> — **Daily payment status report** (${today})`,
+    '',
+  ];
+
+  if (overdue.length > 0) {
+    lines.push(`🚨 **OVERDUE — ad date has passed, payment not received (${overdue.length})**`);
+    for (const b of overdue) {
+      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
+      const paidSoFar = b.payment_amount_received ? ` — paid so far: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
+      lines.push(
+        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}**` +
+        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}` +
+        ` · ${Math.abs(b.daysUntil)} day(s) overdue`
+      );
+    }
+    lines.push('');
+  }
+
+  if (dueSoon.length > 0) {
+    lines.push(`⚠️ **DUE VERY SOON — ad runs within 2 days, still unpaid (${dueSoon.length})**`);
+    for (const b of dueSoon) {
+      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
+      const paidSoFar = b.payment_amount_received ? ` — paid so far: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
+      const when = b.daysUntil === 0 ? 'TODAY' : b.daysUntil === 1 ? 'TOMORROW' : `in ${b.daysUntil} days`;
+      lines.push(
+        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}** (${when})` +
+        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}`
+      );
+    }
+    lines.push('');
+  }
+
+  if (unpaidRest.length > 0) {
+    lines.push(`📋 **Pending payment — upcoming (${unpaidRest.length})**`);
+    for (const b of unpaidRest) {
+      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
+      const paidSoFar = b.payment_amount_received ? ` — paid: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
+      lines.push(
+        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}** (in ${b.daysUntil} days)` +
+        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}`
+      );
+    }
+    lines.push('');
+  }
+
+  lines.push(`_Advertisers have already been DMed. This report is for staff follow-up._`);
+
+  await channel.send(lines.join('\n'));
+  console.log(`Payment check: posted alert — ${overdue.length} overdue, ${dueSoon.length} due soon, ${unpaidRest.length} upcoming unpaid`);
+}
+
+// Schedule daily at 9 AM UTC
+client.once(Events.ClientReady, () => {
+  // Small delay so guild cache is warm before the first run
+  cron.schedule('0 9 * * *', () => {
+    console.log('Running scheduled payment check…');
+    checkOverduePayments().catch(e => console.error('Payment check error:', e));
+  }, { timezone: 'UTC' });
+
+  console.log('Payment overdue checker scheduled for 09:00 UTC daily');
+});
