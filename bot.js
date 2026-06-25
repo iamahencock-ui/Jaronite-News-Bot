@@ -2,8 +2,12 @@
 // Watches for new members who joined via the advertising invite link
 // and pings @advertising organizer in the designated channel.
 //
+// NOTE: This bot runs on the SAME Discord application as the Worker's DM bot
+// and OAuth (one app for everything). Keep DISCORD_BOT_TOKEN pointed at that
+// app's bot.
+//
 // Environment variables (set in Railway dashboard):
-//   DISCORD_BOT_TOKEN      — your bot token
+//   DISCORD_BOT_TOKEN      — your bot token (the one Jaronite News app)
 //   DISCORD_GUILD_ID       — your server ID
 //   NOTIFY_CHANNEL_ID      — channel to post notifications in
 //   NOTIFY_ROLE_ID         — role to ping (@advertising organizer)
@@ -12,7 +16,7 @@
 const { Client, GatewayIntentBits, Events } = require('discord.js');
 
 const TOKEN           = process.env.DISCORD_BOT_TOKEN;
-const GUILD_ID        = process.env.DISCORD_GUILD_ID        || ''; 
+const GUILD_ID        = process.env.DISCORD_GUILD_ID        || '';
 const NOTIFY_CHANNEL  = process.env.NOTIFY_CHANNEL_ID       || '1519191536007512114';
 const NOTIFY_ROLE     = process.env.NOTIFY_ROLE_ID          || '1513126299512864869';
 const WATCH_INVITE    = process.env.WATCH_INVITE_CODE        || '4Gu4ybqDdg';
@@ -115,11 +119,16 @@ client.on(Events.InviteDelete, async (invite) => {
 client.login(TOKEN);
 
 // ================================================================
-// Payment overdue checker
+// Payment status checker
 // Runs daily at 9 AM UTC via node-cron.
 //
-// Fetches all won-but-unpaid bids from the Worker API and posts a
-// summary to the staff channel, pinging @NOTIFY_ROLE.
+// Fetches all won bids from the Worker API and posts a summary to the staff
+// channel, pinging @NOTIFY_ROLE.
+//
+// Updated for the per-view billing model: the Worker now bills rate × views
+// after each ad runs, so we report the invoiced total (`amount_owed`) and the
+// API's derived lifecycle `stage` (late / unpaid / underpaid / etc.) rather
+// than recomputing urgency from the ad date.
 //
 // Additional environment variables needed:
 //   WORKER_BASE_URL        — e.g. https://jaronitenewsinc.ejblox476.workers.dev
@@ -135,7 +144,24 @@ const BOT_API_KEY      = process.env.BOT_API_KEY            || '';
 const PAYMENT_CHANNEL  = process.env.PAYMENT_CHANNEL_ID     || NOTIFY_CHANNEL;
 const PAYMENT_ROLE     = process.env.PAYMENT_ROLE_ID        || NOTIFY_ROLE;
 
-const SLOT_LABELS = { 1: 'Slot 1 (Homepage)', 2: 'Slot 2 (Article)', 3: 'Slot 3 (Sidebar)' };
+// Match the Worker's slot labels so reports read consistently.
+const SLOT_LABELS = {
+  1: 'Bottom Leaderboard (728×90)',
+  2: 'Left Skyscraper (160×600)',
+  3: 'Right Skyscraper (160×600)',
+};
+
+const money = (v) => (v == null ? null : `${Number(v).toFixed(2)} ℐ`);
+
+// Format one bid line. Shows the invoiced total when available (amount_owed),
+// otherwise notes the invoice hasn't been generated yet.
+function fmtBid(b, extra = '') {
+  const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
+  const owed = b.amount_owed != null ? `**${money(b.amount_owed)}**` : '_pending invoice_';
+  const paid = b.payment_amount_received ? ` · paid: ${money(b.payment_amount_received)}` : '';
+  return `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}**` +
+         ` · owed: ${owed}${paid}${extra}`;
+}
 
 // opts.targetChannel — a channel to post into instead of the default PAYMENT_CHANNEL
 //                      (used by the !checkpayments command to reply in-place).
@@ -179,84 +205,71 @@ async function checkOverduePayments(opts = {}) {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  // Bucket bids by urgency
-  const overdue   = [];  // ad date has passed, still unpaid
-  const dueSoon   = [];  // ad date is within 2 days, still unpaid
-  const unpaidRest = []; // unpaid with more than 2 days to go
+  // Bucket by the API's derived lifecycle stage.
+  const late        = []; // invoice sent, unpaid past the grace window — chase these
+  const underpaid   = []; // partial payment received, balance outstanding
+  const unpaid      = []; // invoice sent, still within grace
+  const notInvoiced = []; // won but the ad hasn't run / been invoiced yet
 
-  for (const bid of bids) {
-    const status = bid.payment_status;
-    if (status !== 'awaiting_payment' && status !== 'underpaid') continue;
-
-    const daysUntil = Math.ceil(
-      (new Date(bid.target_date) - new Date(today)) / 86400000
-    );
-
-    if (daysUntil < 0)      overdue.push({ ...bid, daysUntil });
-    else if (daysUntil <= 2) dueSoon.push({ ...bid, daysUntil });
-    else                     unpaidRest.push({ ...bid, daysUntil });
+  for (const bid of (Array.isArray(bids) ? bids : [])) {
+    switch (bid.stage) {
+      case 'late':             late.push(bid); break;
+      case 'underpaid':        underpaid.push(bid); break;
+      case 'unpaid':           unpaid.push(bid); break;
+      case 'won':
+      case 'awaiting_invoice': notInvoiced.push(bid); break;
+      default: break; // paid / overpaid / lost / pending → nothing to chase
+    }
   }
 
-  const total = overdue.length + dueSoon.length + unpaidRest.length;
+  const total = late.length + underpaid.length + unpaid.length + notInvoiced.length;
   if (total === 0) {
-    console.log('Payment check: all won bids are paid — no alert needed');
+    console.log('Payment check: nothing outstanding');
     if (announceClear && channel) {
-      await channel.send('✅ All won ad bids are paid up — nothing outstanding.');
+      await channel.send('✅ All invoiced ad bids are paid up — nothing outstanding.');
     }
     return;
   }
 
-  // Build the message
   const lines = [
-    `💸 <@&${PAYMENT_ROLE}> — **Daily payment status report** (${today})`,
+    `💸 <@&${PAYMENT_ROLE}> — **Daily ad payment report** (${today})`,
     '',
   ];
 
-  if (overdue.length > 0) {
-    lines.push(`🚨 **OVERDUE — ad date has passed, payment not received (${overdue.length})**`);
-    for (const b of overdue) {
-      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
-      const paidSoFar = b.payment_amount_received ? ` — paid so far: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
-      lines.push(
-        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}**` +
-        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}` +
-        ` · ${Math.abs(b.daysUntil)} day(s) overdue`
-      );
+  if (late.length > 0) {
+    lines.push(`🚨 **LATE — invoiced, unpaid past the grace window (${late.length})**`);
+    for (const b of late) lines.push(fmtBid(b));
+    lines.push('');
+  }
+  if (underpaid.length > 0) {
+    lines.push(`➗ **UNDERPAID — partial payment, balance due (${underpaid.length})**`);
+    for (const b of underpaid) {
+      const remaining = (b.amount_owed != null)
+        ? ` · remaining: **${money(Math.max(0, b.amount_owed - (b.payment_amount_received || 0)))}**`
+        : '';
+      lines.push(fmtBid(b, remaining));
     }
     lines.push('');
   }
-
-  if (dueSoon.length > 0) {
-    lines.push(`⚠️ **DUE VERY SOON — ad runs within 2 days, still unpaid (${dueSoon.length})**`);
-    for (const b of dueSoon) {
-      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
-      const paidSoFar = b.payment_amount_received ? ` — paid so far: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
-      const when = b.daysUntil === 0 ? 'TODAY' : b.daysUntil === 1 ? 'TOMORROW' : `in ${b.daysUntil} days`;
-      lines.push(
-        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}** (${when})` +
-        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}`
-      );
-    }
+  if (unpaid.length > 0) {
+    lines.push(`📋 **AWAITING PAYMENT — invoice sent recently (${unpaid.length})**`);
+    for (const b of unpaid) lines.push(fmtBid(b));
+    lines.push('');
+  }
+  if (notInvoiced.length > 0) {
+    lines.push(`🗓️ **WON — ad not yet run / invoiced (${notInvoiced.length})**`);
+    for (const b of notInvoiced) lines.push(fmtBid(b));
     lines.push('');
   }
 
-  if (unpaidRest.length > 0) {
-    lines.push(`📋 **Pending payment — upcoming (${unpaidRest.length})**`);
-    for (const b of unpaidRest) {
-      const label = SLOT_LABELS[b.slot_number] || `Slot ${b.slot_number}`;
-      const paidSoFar = b.payment_amount_received ? ` — paid: ${Number(b.payment_amount_received).toFixed(2)} ℐ` : '';
-      lines.push(
-        `> **Bid #${b.id}** · ${b.advertiser_name} (\`${b.contact}\`) · ${label} · **${b.target_date}** (in ${b.daysUntil} days)` +
-        ` · owed: **${Number(b.bid_amount).toFixed(2)} ℐ**${paidSoFar}`
-      );
-    }
-    lines.push('');
+  lines.push(`_Advertisers are notified automatically (Discord DM, plus email if provided). This report is for staff follow-up._`);
+
+  // Discord messages cap at 2000 chars — chunk if needed.
+  const full = lines.join('\n');
+  for (let i = 0; i < full.length; i += 1900) {
+    await channel.send(full.slice(i, i + 1900));
   }
-
-  lines.push(`_Advertisers have already been DMed. This report is for staff follow-up._`);
-
-  await channel.send(lines.join('\n'));
-  console.log(`Payment check: posted alert — ${overdue.length} overdue, ${dueSoon.length} due soon, ${unpaidRest.length} upcoming unpaid`);
+  console.log(`Payment check: ${late.length} late, ${underpaid.length} underpaid, ${unpaid.length} awaiting, ${notInvoiced.length} not-yet-invoiced`);
 }
 
 // ================================================================
